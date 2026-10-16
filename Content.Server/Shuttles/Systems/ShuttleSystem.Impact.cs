@@ -23,6 +23,7 @@ using Robust.Shared.Physics.Dynamics;
 using Robust.Shared.Physics.Events;
 using Robust.Shared.Prototypes;
 using Robust.Shared.Random;
+using Robust.Shared.Timing;
 using System.Numerics;
 
 using Content.Server._Mono.Cleanup;
@@ -74,6 +75,16 @@ public sealed partial class ShuttleSystem
     private HashSet<EntityUid> _intersecting = new();
     // for _adminLogSpacing
     private Dictionary<EntityUid, TimeSpan> _impactedAt = new();
+    // One heavy impact pass per grid-pair per tick — fixture contacts after IMapManager/physics
+    // bumps otherwise re-run ThrowEntitiesOnGrid for every overlapping fixture (ram / drill scrape / AME debris).
+    private readonly HashSet<(EntityUid, EntityUid)> _impactsThisTick = new();
+    private GameTick _impactTick;
+
+    /// <summary>
+    /// Tile breaks must not run inside StartCollide / physics contact generation — SetTiles rebuilds
+    /// grid chunk fixtures and leaves stale Broadphase proxies (Entity 0 crash on client+server).
+    /// </summary>
+    private readonly List<(EntityUid Grid, List<(Vector2i, Tile)> Broken, List<Vector2i> Sparks)> _deferredTileBreaks = new();
 
     private void InitializeImpact()
     {
@@ -105,6 +116,25 @@ public sealed partial class ShuttleSystem
     }
 
     /// <summary>
+    /// Apply deferred impact tile breaks after physics has finished the current collide pass.
+    /// </summary>
+    private void UpdateDeferredImpactTileBreaks()
+    {
+        if (_deferredTileBreaks.Count == 0)
+            return;
+
+        foreach (var (gridUid, broken, sparks) in _deferredTileBreaks)
+        {
+            if (TerminatingOrDeleted(gridUid) || !TryComp(gridUid, out MapGridComponent? grid))
+                continue;
+
+            ProcessBrokenTilesAndSparks(gridUid, grid, broken, sparks);
+        }
+
+        _deferredTileBreaks.Clear();
+    }
+
+    /// <summary>
     /// Handles collision between two shuttles, applying impact damage and effects.
     /// </summary>
     private void OnShuttleCollide(EntityUid uid, ShuttleComponent component, ref StartCollideEvent args)
@@ -118,6 +148,22 @@ public sealed partial class ShuttleSystem
         if (!_gridQuery.TryComp(args.OurEntity, out var ourGrid) ||
             !_gridQuery.TryComp(args.OtherEntity, out var otherGrid)
         )
+            return;
+
+        // Map-as-grid entities must never go through shuttle impact (planet maps after IMapManager removal).
+        if (HasComp<MapComponent>(args.OurEntity) || HasComp<MapComponent>(args.OtherEntity))
+            return;
+
+        if (_impactTick != _gameTiming.CurTick)
+        {
+            _impactTick = _gameTiming.CurTick;
+            _impactsThisTick.Clear();
+        }
+
+        var impactPair = args.OurEntity.CompareTo(args.OtherEntity) <= 0
+            ? (args.OurEntity, args.OtherEntity)
+            : (args.OtherEntity, args.OurEntity);
+        if (!_impactsThisTick.Add(impactPair))
             return;
 
         var ourBody = args.OurBody;
@@ -144,6 +190,9 @@ public sealed partial class ShuttleSystem
             // Get the velocity in relation to the contact normal
             // If this still causes issues see https://box2d.org/posts/2020/06/ghost-collisions/
             // This should only be a potential problem on chunk seams.
+            if (jungleDiff < float.Epsilon || worldNormal.LengthSquared() < float.Epsilon)
+                continue;
+
             var dotProduct = MathF.Abs(Vector2.Dot(topDiff.Normalized(), worldNormal.Normalized()));
             jungleDiff *= dotProduct;
 
@@ -271,7 +320,8 @@ public sealed partial class ShuttleSystem
         _physics.ApplyLinearImpulse(ent, deltaV * body.FixturesMass, body: body);
 
         // process tile and entity damage
-        ProcessImpactZone(ent, grid, tile, energy, deltaV.Normalized(), radius);
+        var dir = deltaV.LengthSquared() > float.Epsilon ? deltaV.Normalized() : Vector2.Zero;
+        ProcessImpactZone(ent, grid, tile, energy, dir, radius);
 
         // throw every entity on grid if the impulse is not negligible
         if (deltaV.Length() > _minImpulseVelocity)
@@ -398,11 +448,10 @@ public sealed partial class ShuttleSystem
 
         ProcessTileBatch(uid, grid, tilesToProcess, dir, 0, tilesToProcess.Count, brokenTiles, sparkTiles);
 
-        // Only proceed with visual effects if the entity still exists
-        if (Exists(uid))
-        {
-            ProcessBrokenTilesAndSparks(uid, grid, brokenTiles, sparkTiles);
-        }
+        // Defer SetTiles — breaking floors mid-StartCollide rebuilds grid fixtures while
+        // BroadphaseContactJob still holds stale proxies (Entity 0 / invalid contact crashes).
+        if (brokenTiles.Count > 0 || sparkTiles.Count > 0)
+            _deferredTileBreaks.Add((uid, brokenTiles, sparkTiles));
     }
 
     /// <summary>
